@@ -1,6 +1,8 @@
 flacify
 =======
 
+**TODO**: Currently only does a dry run, actually performing the conversion still needs to be done.
+
 Tool for converting all lossless uncompressed audio samples (WAV, AIFF) in a
 directory into FLAC files. Intended to be used on large sample libraries.
 Anecdotally, on my sample library of around 80 GB it was able to save about
