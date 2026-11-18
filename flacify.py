@@ -2,6 +2,7 @@
 import functools
 import os
 import re
+import shutil
 import sys
 import time
 import typing
@@ -12,7 +13,6 @@ from itertools import chain
 from math import floor, log10
 from multiprocessing.pool import Pool
 from pathlib import Path
-from shutil import get_terminal_size, which
 from signal import SIGINT, signal
 from subprocess import CalledProcessError, run
 from tempfile import mkstemp
@@ -33,14 +33,6 @@ LogLevel = typing.Literal[
 LOG_LEVELS: tuple[LogLevel, ...] = typing.get_args(LogLevel)
 
 
-def log(level: LogLevel, message: typing.Any, file=sys.stderr):
-    print(f"{level}: {message}", file=file)
-
-
-def log_message(level: LogLevel, message: typing.Any) -> str:
-    return f"{level}: {message}"
-
-
 @dataclass
 class Options:
     sample_directory: Path
@@ -54,6 +46,15 @@ class Options:
     ffmpeg_path: Path | None
     ffprobe_path: Path | None
     log_levels: tuple[LogLevel, ...]
+
+
+def log(options: Options, level: LogLevel, message: typing.Any, file=sys.stderr):
+    if level in options.log_levels:
+        print(f"{level}: {message}", file=file)
+
+
+def log_message(level: LogLevel, message: typing.Any) -> str:
+    return f"{level}: {message}"
 
 
 def parse_args(args: list[str]) -> Options:
@@ -78,7 +79,8 @@ def parse_args(args: list[str]) -> Options:
         help="Number of parallel jobs to use. Defaults to number of CPU cores minus 1",
     )
     parser.add_argument(
-        "-x", "--no-dry-run",
+        "-x",
+        "--no-dry-run",
         action="store_true",
         help="Proceed with converting to flac and removing corresponding wav files instead of just printing the space that would be saved",
     )
@@ -107,21 +109,21 @@ def parse_args(args: list[str]) -> Options:
     parser.add_argument(
         "--ffmpeg-path",
         type=Path,
-        default=which("ffmpeg"),
+        default=shutil.which("ffmpeg"),
         help="Path to the ffmpeg executable. Only required if it cannot be found in PATH",
     )
     parser.add_argument(
         "--ffprobe-path",
         type=Path,
-        default=which("ffprobe"),
+        default=shutil.which("ffprobe"),
         help="Path to the ffprobe executable. Only required if it cannot be found in PATH",
     )
     parser.add_argument(
         "--log-level",
         type=str,
         choices=LOG_LEVELS,
-        default="WARNING",
-        help="Maximum level of log messages to include. Defaults to WARNING",
+        default="INFO",
+        help="Maximum level of log messages to include. Defaults to INFO",
     )
     parser.add_argument(
         "sample_directory",
@@ -156,6 +158,8 @@ def flacify_file(options: Options, fp: Path) -> Result:
         return Result(0, log_message("INFO", f"Skipping hidden file {fp}"))
 
     message = []
+
+    # Process exclusions
     excluded = False
     for pattern in options.excluded_paths:
         if pattern.search(str(fp)):
@@ -165,6 +169,27 @@ def flacify_file(options: Options, fp: Path) -> Result:
         message.append(log_message("INFO", f"Skipping excluded file {fp}"))
         return Result(0, message)
 
+    # Handle existing files
+    out_fp = fp.with_suffix(".flac")
+    if out_fp.exists():
+        if options.no_dry_run:
+            message.append(
+                log_message(
+                    "INFO",
+                    f"Converted file {out_fp} appears to already exist; removing unconverted file {fp} and continuing",
+                )
+            )
+            os.remove(fp)
+        else:
+            message.append(
+                log_message(
+                    "INFO",
+                    f"Converted file {out_fp} appears to already exist; would remove unconverted file {fp} before continuing",
+                )
+            )
+        return Result(0, message)
+
+    # Retrieve audio codec information from file
     try:
         command = (
             str(options.ffprobe_path),
@@ -177,7 +202,7 @@ def flacify_file(options: Options, fp: Path) -> Result:
         message.append(
             log_message("VERBOSE", f"Retrieving audio codec information for file {fp}")
         )
-        message.append(log_message("VERBOSE", {command}))
+        message.append(log_message("VERBOSE", command))
         out = run(command, capture_output=True, check=True)
     except CalledProcessError as e:
         message.append(
@@ -188,6 +213,7 @@ def flacify_file(options: Options, fp: Path) -> Result:
         )
         return Result(0, message)
 
+    # Parse out audio codec metadata
     sample_fmt_match = re.search(
         r"^.*sample_fmt=(.*)", out.stdout.decode(), flags=re.MULTILINE
     )
@@ -221,6 +247,7 @@ def flacify_file(options: Options, fp: Path) -> Result:
         )
         return Result(0, message)
 
+    # Skip formats and bit depths we shouldn't process
     if sample_fmt.startswith(("s", "u")) and bit_depth not in (4, 8, 16, 24, 32):
         message.append(
             log_message(
@@ -234,7 +261,7 @@ def flacify_file(options: Options, fp: Path) -> Result:
         message.append(
             log_message(
                 "INFO",
-                "Skipping 32 bit floating point audio file {fp} since --normalize-floats was not passed",
+                f"Skipping 32 bit floating point audio file {fp} since --normalize-floats was not passed",
             )
         )
         return Result(0, message)
@@ -242,11 +269,12 @@ def flacify_file(options: Options, fp: Path) -> Result:
         message.append(
             log_message(
                 "INFO",
-                "Skipping 64 bit floating point audio file {fp} since --normalize-doubles was not passed",
+                f"Skipping 64 bit floating point audio file {fp} since --normalize-doubles was not passed",
             )
         )
         return Result(0, message)
 
+    # Get peak level of floating point files and add gain reduction filter
     extra_filters = []
     if (options.normalize_floats and sample_fmt.startswith("flt")) or (
         options.normalize_doubles and sample_fmt.startswith("dbl")
@@ -313,8 +341,7 @@ def flacify_file(options: Options, fp: Path) -> Result:
                     )
                 )
 
-    if options.no_dry_run:
-        pass  # TODO: actually do the conversion
+    # Actually perform the conversion
     out_fd, out_fn = mkstemp(suffix=".flac")
     os.close(out_fd)
     try:
@@ -340,7 +367,6 @@ def flacify_file(options: Options, fp: Path) -> Result:
 
     orig_size = fp.stat().st_size
     new_size = os.stat(out_fn).st_size
-    os.remove(out_fn)
 
     saved = orig_size - new_size
     if saved > 0:
@@ -350,6 +376,25 @@ def flacify_file(options: Options, fp: Path) -> Result:
                 f"Processed file {fp}; saved {format_byte_count(saved, pad=False)}",
             )
         )
+
+        if options.no_dry_run:
+            message.append(
+                log_message(
+                    "INFO", f"Copying temp file {out_fn} to {out_fp} and removing {fp}"
+                )
+            )
+            shutil.copy(out_fn, out_fp)
+            shutil.copystat(fp, out_fp)
+            shutil.copymode(fp, out_fp)
+            os.remove(fp)
+        else:
+            message.append(
+                log_message(
+                    "INFO", f"Would copy temp file {out_fn} to {out_fp} and remove {fp}"
+                )
+            )
+
+        os.remove(out_fn)
         return Result(saved, message)
 
     message.append(
@@ -357,6 +402,7 @@ def flacify_file(options: Options, fp: Path) -> Result:
             "INFO", f"Would not save any space by converting file {fp}; skipped"
         )
     )
+    os.remove(out_fn)
     return Result(0, message)
 
 
@@ -379,7 +425,7 @@ def format_byte_count(byte_count: int, pad=True) -> str:
 
 
 def initialize_worker():
-    # Catch ctrl+C but finish work first
+    # Catch ctrl+C to finish work first
     signal(SIGINT, lambda _, __: None)
 
 
@@ -387,6 +433,7 @@ def main():
     options = parse_args(sys.argv[1:])
     if options.ffmpeg_path is None:
         log(
+            options,
             "ERROR",
             "could not automatically determine ffmpeg path, please pass it manually with --ffmpeg-path",
         )
@@ -394,11 +441,11 @@ def main():
     else:
         try:
             command = (options.ffmpeg_path, "-version")
-            log("VERBOSE", command)
+            log(options, "VERBOSE", command)
             out = run(command, capture_output=True, check=True)
-            print("VERBOSE", out.stdout.decode().strip())
+            log(options, "VERBOSE", out.stdout.decode().strip())
         except CalledProcessError as e:
-            log("ERROR", f"Attempt to run ffmpeg failed\noutput: {e.stderr.decode()}")
+            log(options, "ERROR", f"Attempt to run ffmpeg failed\noutput: {e.stderr.decode()}")
     if options.ffprobe_path is None:
         print(
             "ERROR",
@@ -408,11 +455,11 @@ def main():
     else:
         try:
             command = (options.ffprobe_path, "-version")
-            print("VERBOSE", command)
+            log(options, "VERBOSE", command)
             out = run(command, capture_output=True, check=True)
-            print("VERBOSE", out.stdout.decode().strip())
+            log(options, "VERBOSE", out.stdout.decode().strip())
         except CalledProcessError as e:
-            log("ERROR", f"Attempt to run ffprobe failed\noutput: {e.stderr.decode()}")
+            log(options, "ERROR", f"Attempt to run ffprobe failed\noutput: {e.stderr.decode()}")
 
     lossless_file_extensions = ("wav", "aif")
     lossless_file_paths = list(
@@ -421,7 +468,7 @@ def main():
             for ext in lossless_file_extensions
         )
     )
-    cols, _ = get_terminal_size()
+    cols, _ = shutil.get_terminal_size()
     n_processed = 0
     n_total = len(lossless_file_paths)
     bytes_saved_total = 0
@@ -450,10 +497,11 @@ def main():
                         print(line, file=sys.stderr)
 
                     if sys.stderr.isatty() and sys.stdout.isatty() and len(lines) > 0:
+                        # Keep last status message at the bottom
                         print(last_status_message, end="")
 
                 now = time.time()
-                # Print status every 2 seconds or on last iteration
+                # Update status every second or on last iteration
                 if sys.stdout.isatty() and (
                     now - last_status_time > 1 or n_processed == n_total
                 ):
